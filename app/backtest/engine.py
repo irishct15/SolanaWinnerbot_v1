@@ -1,141 +1,261 @@
 ﻿# app/backtest/engine.py
-import csv, os, json, hashlib, random
-from typing import Dict, Any, Iterable
+import csv, json, os
+from typing import List, Dict, Any, Tuple
+from datetime import datetime
 
-def _pick(cfg: Dict[str, Any], key: str, *layers, default=None):
-    # Look in params, then backtest, then sim, then top-level
-    for d in layers:
-        if isinstance(d, dict) and key in d:
-            return d[key]
-    return default
+ISO = "%Y-%m-%dT%H:%M:%SZ"
 
-def _iter_jsonl(path: str) -> Iterable[Dict[str, Any]]:
+def _rget(d, path, default=None):
+    cur = d
+    for k in path:
+        if not isinstance(cur, dict) or k not in cur:
+            return default
+        cur = cur[k]
+    return cur
+
+def _parse_iso(s: str) -> datetime:
+    # accepts "...Z" or plain ISO
+    s = s.strip()
+    if s.endswith("Z"):
+        return datetime.strptime(s, ISO)
+    try:
+        return datetime.fromisoformat(s.replace("Z",""))
+    except Exception:
+        return datetime.strptime(s, ISO)
+
+def _load_events(path:str) -> List[Dict[str,Any]]:
+    out = []
     with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
+        for ln in f:
+            ln = ln.strip()
+            if not ln: continue
             try:
-                yield json.loads(line)
+                j = json.loads(ln)
+                out.append(j)
             except Exception:
-                # tolerate occasional junk lines
+                # tolerate bad lines
                 continue
+    out.sort(key=lambda r: r.get("t",""))
+    return out
 
-def _seed_for(pair: str, ts: str) -> int:
-    h = hashlib.sha256(f"{pair}|{ts}".encode("utf-8")).hexdigest()
-    return int(h[:16], 16)  # deterministic across runs/processes
+def _load_ticks_csv(path: str) -> List[Tuple[datetime, float]]:
+    out = []
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        rdr = csv.DictReader(f)
+        for r in rdr:
+            ts = r.get("ts") or r.get("time")
+            px = r.get("price") or r.get("px")
+            if ts is None or px is None: continue
+            try:
+                out.append((_parse_iso(ts), float(px)))
+            except Exception:
+                pass
+    out.sort(key=lambda t: t[0])
+    return out
 
-def run_backtest(cfg: Dict[str, Any] | None = None) -> int:
-    """Minimal deterministic backtest:
-       - Reads events JSONL (pair, t, price required; side optional)
-       - For each event: simulate up to max_bars with bounded returns
-       - TP/SL, optional breakeven, fees + slippage in bps (round trip)
-       - Writes CSV to cfg['trade_log_csv']
-    """
+def _find_entry_index(ticks: List[Tuple[datetime,float]], t_event: datetime) -> int:
+    # first tick with ts >= event time
+    lo, hi = 0, len(ticks)-1
+    ans = len(ticks)
+    while lo <= hi:
+        mid = (lo+hi)//2
+        if ticks[mid][0] >= t_event:
+            ans = mid
+            hi = mid-1
+        else:
+            lo = mid+1
+    return ans if ans < len(ticks) else -1
+
+def _sim_trade(
+    ticks: List[Tuple[datetime,float]],
+    i0: int,
+    entry_ts: datetime,
+    entry_px_obs: float,
+    side: str,
+    *,
+    max_bars: int,
+    tp_mult: float,
+    sl_pct: float,
+    trail_frac: float,
+    late_after_frac: float,
+    late_tp_frac: float,
+    slippage_bps: float,
+    base_size_usd: float,
+    fee_bps: float,
+) -> Dict[str,Any]:
+    # Entry execution price w/ slippage (long only for now)
+    m = slippage_bps/10000.0
+    entry_exec = entry_px_obs * (1 + m)
+
+    units = base_size_usd / entry_exec if entry_exec > 0 else 0.0
+
+    tp_px   = entry_px_obs * tp_mult if tp_mult and tp_mult>0 else float("inf")
+    sl_px   = entry_px_obs * (1 - sl_pct) if sl_pct and sl_pct>0 else -float("inf")
+
+    high_water = entry_px_obs
+    late_active = False
+
+    exit_reason = "timeout"
+    exit_idx = min(i0 + max_bars, len(ticks)-1)
+
+    for i in range(i0, min(i0 + max_bars, len(ticks))):
+        ts, px = ticks[i]
+        if px <= 0: continue
+
+        # track high watermark
+        if px > high_water:
+            high_water = px
+
+        # activate late-tp once price moved late_after_frac over entry
+        if not late_active and late_after_frac and high_water >= entry_px_obs*(1+late_after_frac):
+            late_active = True
+
+        # check exits (priority order)
+        # 1) classic TP (close >= target)
+        if px >= tp_px:
+            exit_reason = "tp"
+            exit_idx = i
+            break
+
+        # 2) late take-profit: if activated and drawdown from high >= late_tp_frac
+        if late_active and late_tp_frac and high_water>0 and (high_water - px)/high_water >= late_tp_frac:
+            exit_reason = "late_tp"
+            exit_idx = i
+            break
+
+        # 3) trailing stop: price <= high*(1 - trail_frac)
+        if trail_frac and high_water>0 and px <= high_water*(1 - trail_frac):
+            exit_reason = "trail"
+            exit_idx = i
+            break
+
+        # 4) stop loss: price <= entry*(1 - sl_pct)
+        if px <= sl_px:
+            exit_reason = "sl"
+            exit_idx = i
+            break
+
+    exit_ts, exit_px_obs = ticks[exit_idx]
+
+    # execution with slippage on exit (sell)
+    exit_exec = exit_px_obs * (1 - m)
+
+    # gross pnl in USD
+    pnl_usd_gross = units * (exit_exec - entry_exec)
+
+    # fees: fee_bps per side on notional ~ base_size_usd
+    fee = fee_bps/10000.0
+    fees_usd = base_size_usd * fee * 2.0
+
+    pnl_usd = pnl_usd_gross - fees_usd
+    roi_pct = (pnl_usd / base_size_usd) * 100.0 if base_size_usd>0 else 0.0
+
+    bars_held = max(0, exit_idx - i0 + 1)
+
+    return {
+        "entry_ts": entry_ts.strftime(ISO),
+        "exit_ts": exit_ts.strftime(ISO),
+        "entry_px": round(entry_px_obs, 8),
+        "exit_px": round(exit_px_obs, 8),
+        "bars_held": bars_held,
+        "exit": exit_reason,
+        "pnl_pct": round(roi_pct, 3),
+        "size_usd": round(base_size_usd, 2),
+        "pnl_usd": round(pnl_usd, 2),
+        "fees_usd": round(fees_usd, 4),
+        "tp_mult": tp_mult,
+        "sl_pct": sl_pct,
+        "trail_frac": trail_frac,
+        "late_tp_after_frac": late_after_frac,
+        "late_tp_frac": late_tp_frac,
+        "slippage_bps": slippage_bps,
+        "fee_bps": fee_bps,
+        "max_bars": max_bars,
+    }
+
+def run_backtest(cfg: Dict[str,Any]=None) -> int:
     cfg = cfg or {}
-    ds  = cfg.get("dataset", {}) or {}
-    params   = cfg.get("params", {}) or {}
-    backtest = cfg.get("backtest", {}) or {}
-    sim      = cfg.get("sim", {}) or {}
-    risk     = cfg.get("risk", {}) or {}
+    ds   = _rget(cfg, ["dataset"], {})
+    params = _rget(cfg, ["params"], {})
+    bt   = _rget(cfg, ["backtest"], {})
+    sim  = _rget(cfg, ["sim"], {})
+    risk = _rget(cfg, ["risk"], {})
 
-    out_csv = cfg.get("trade_log_csv") or "artifacts/trades.engine.csv"
+    events_path = ds.get("events_jsonl") or "data/raw/events.jsonl"
+    ticks_dir   = ds.get("ticks_dir") or "data/real/ticks"
+    out_csv     = cfg.get("trade_log_csv") or "artifacts/trades.engine.csv"
+
+    tp_mult = params.get("tp_mult", bt.get("tp_mult", 1.02))
+    sl_pct  = params.get("sl_pct",  bt.get("sl_pct", 0.02))
+    max_bars = int(params.get("max_bars", bt.get("max_bars", 12)))
+
+    late_tp_frac = float(params.get("late_tp_frac",  sim.get("late_tp_frac", 0.0)))
+    late_after_frac = float(params.get("late_tp_after_frac", sim.get("late_tp_after_frac", 0.0)))
+    trail_frac = float(params.get("trail_frac", sim.get("trail_frac", 0.0)))
+
+    slippage_bps = float(sim.get("slippage_bps", 0))
+    base_size_usd = float(risk.get("base_size_usd", 200))
+    fee_bps = float(risk.get("fee_bps", 0))
+
     os.makedirs(os.path.dirname(out_csv) or ".", exist_ok=True)
 
-    events_path = ds.get("events_jsonl")
-    if not events_path or not os.path.exists(events_path):
-        raise FileNotFoundError(f"events_jsonl not found: {events_path!r}")
+    # load events
+    events = _load_events(events_path)
 
-    # knobs
-    tp_mult        = _pick(cfg, "tp_mult", params, backtest, default=1.02)  # 2% TP by default
-    sl_pct         = _pick(cfg, "sl_pct", params, backtest, default=0.02)   # 2% SL
-    max_bars       = int(_pick(cfg, "max_bars", params, backtest, default=12))
-    be_arm_frac    = float(_pick(cfg, "be_arm_frac", params, sim, default=0.0))
-    fee_bps        = int(risk.get("fee_bps", 0))
-    slippage_bps   = int(sim.get("slippage_bps", 0))
+    # group ticks per pair
+    cache_ticks: Dict[str, List[Tuple[datetime,float]]] = {}
 
-    # simple, bounded “vol” model (deterministic per event)
-    vol_pct = 0.015  # ±1.5% step range
+    rows_out: List[Dict[str,Any]] = []
+    for ev in events:
+        pair = (ev.get("pair") or "").replace("/","_")
+        side = ev.get("side","buy")
+        if side != "buy":
+            # only long simulated for now
+            continue
+        t_event = _parse_iso(ev.get("t"))
 
-    rows = []
-    for ev in _iter_jsonl(events_path):
-        pair = str(ev.get("pair", "UNKNOWN/USDC"))
-        ts   = str(ev.get("t", ""))
-        try:
-            entry_px = float(ev.get("price", 1.0))
-        except Exception:
-            entry_px = 1.0
+        tick_path = os.path.join(ticks_dir, f"{pair}.csv")
+        if pair not in cache_ticks:
+            if not os.path.exists(tick_path):
+                continue
+            cache_ticks[pair] = _load_ticks_csv(tick_path)
+        ticks = cache_ticks[pair]
+        if not ticks: 
+            continue
 
-        if entry_px <= 0:
-            entry_px = 1.0
+        idx = _find_entry_index(ticks, t_event)
+        if idx < 0: 
+            continue
 
-        # seed RNG for deterministic path per event
-        rng = random.Random(_seed_for(pair, ts))
+        entry_ts, entry_px = ticks[idx]
 
-        tp = entry_px * float(tp_mult)
-        sl = entry_px * (1.0 - float(sl_pct))
-        be_active = False
+        info = _sim_trade(
+            ticks, idx, entry_ts, entry_px, side,
+            max_bars=max_bars,
+            tp_mult=float(tp_mult),
+            sl_pct=float(sl_pct),
+            trail_frac=trail_frac,
+            late_after_frac=late_after_frac,
+            late_tp_frac=late_tp_frac,
+            slippage_bps=slippage_bps,
+            base_size_usd=base_size_usd,
+            fee_bps=fee_bps,
+        )
+        info["pair"] = pair.replace("_","/")
+        rows_out.append(info)
 
-        price = entry_px
-        bars_held = 0
-        exit_kind = "timeout"
-
-        for i in range(1, max_bars + 1):
-            # bounded uniform step in ±vol_pct
-            step = (rng.random() * 2.0 - 1.0) * vol_pct
-            price *= (1.0 + step)
-            bars_held = i
-
-            # arm breakeven when price moves enough in favor
-            if not be_active and be_arm_frac and price >= entry_px * (1.0 + be_arm_frac):
-                be_active = True
-                sl = entry_px  # move stop to breakeven
-
-            if price >= tp:
-                exit_kind = "tp"
-                break
-            if price <= sl:
-                exit_kind = "sl"
-                break
-
-        exit_px = price
-
-        # Apply simple round-trip costs (entry + exit)
-        rt_cost = 2.0 * (fee_bps + slippage_bps) / 10_000.0  # convert bps to fraction
-        pnl_frac = (exit_px / entry_px) - 1.0 - rt_cost
-        pnl_pct  = pnl_frac * 100.0
-
-        rows.append({
-            "pair": pair,
-            "entry_ts": ts,
-            "exit_ts": ts,  # synthetic; you can later compute real timestamps using ticks
-            "entry_px": round(entry_px, 8),
-            "exit_px": round(exit_px, 8),
-            "pnl_pct": round(pnl_pct, 4),
-            "exit": exit_kind,
-            "bars_held": bars_held,
-            "fees_bps": fee_bps,
-            "slip_bps": slippage_bps,
-            "tp_mult": tp_mult,
-            "sl_pct": sl_pct,
-            "be_arm_frac": be_arm_frac,
-            "max_bars": max_bars,
-        })
-
-    # Write CSV
-    if not rows:
-        # still write a header so downstream tools don't crash
-        rows = [{
-            "pair":"N/A","entry_ts":"","exit_ts":"","entry_px":0,"exit_px":0,
-            "pnl_pct":0,"exit":"none","bars_held":0,"fees_bps":fee_bps,
-            "slip_bps":slippage_bps,"tp_mult":tp_mult,"sl_pct":sl_pct,
-            "be_arm_frac":be_arm_frac,"max_bars":max_bars
-        }]
-
-    fieldnames = list(rows[0].keys())
+    # write CSV
+    if rows_out:
+        fields = list(rows_out[0].keys())
+    else:
+        fields = ["pair","entry_ts","exit_ts","entry_px","exit_px","bars_held","exit",
+                  "pnl_pct","size_usd","pnl_usd","fees_usd","tp_mult","sl_pct",
+                  "trail_frac","late_tp_after_frac","late_tp_frac",
+                  "slippage_bps","fee_bps","max_bars"]
     with open(out_csv, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
-        w.writerows(rows)
+        for r in rows_out:
+            w.writerow(r)
 
     return 0
