@@ -1,0 +1,32 @@
+﻿mode: backtest
+dataset:
+  type: jsonl
+  events_jsonl: data/raw/events.jsonl
+  ticks_dir: data/real/ticks
+
+backtest:
+  max_bars: 12
+  tp_mult:  1.02
+  sl_pct:   0.02
+
+sim:
+  slippage_bps: 10
+  be_arm_frac: 0.001
+  use_breakeven: true
+  late_tp_frac: 0.5
+  late_tp_after_frac: 0.5
+
+risk:
+  base_size_usd: 200
+  fee_bps: 0
+
+params:
+  max_bars: 12
+  tp_mult:  1.02
+  sl_pct:   0.02
+  be_arm_frac: 0.001
+  use_breakeven: true
+  late_tp_frac: 0.5
+  late_tp_after_frac: 0.5
+
+trade_log_csv: artifacts/trades.quick.csv
